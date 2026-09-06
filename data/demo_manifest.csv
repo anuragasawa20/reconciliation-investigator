@@ -1,0 +1,4 @@
+scenario,invoice_id,ground_truth_label,expected_action
+easy_win,INV-DEMO-FEE-0001,gateway_fee,AUTO_RESOLVE
+investigation,INV-DEMO-REFUND-0001,refund,HUMAN_REVIEW
+hard_case,INV-DEMO-AMBIG-0001,ambiguous,ESCALATE
