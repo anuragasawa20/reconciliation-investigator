@@ -1,1 +1,1 @@
-"""Test package for standard-library unittest discovery."""
+"""Test package for the reconciliation investigator."""
