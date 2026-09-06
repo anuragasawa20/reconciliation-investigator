@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
+from agents.llm import StructuredLLMClient, default_llm_client, jsonable
+
 
 Hypothesis = Literal[
     "gateway_fee",
@@ -56,10 +58,18 @@ def validate_hypotheses(
     hypotheses: Iterable[str] | None = None,
     *,
     amount_tolerance: Decimal = MONEY,
+    llm_client: StructuredLLMClient | None = None,
+    use_llm: bool | None = None,
 ) -> list[HypothesisResult]:
     """Validate all requested hypotheses against the full evidence set at once."""
     bundles = _normalize_bundles(evidence_bundles)
     requested = tuple(_controlled_hypotheses(hypotheses or bundles))
+    active_client = llm_client if use_llm is not False else None
+    if active_client is None and use_llm is not False:
+        active_client = default_llm_client()
+    if active_client is not None:
+        return _validate_with_llm(bundles, requested, active_client)
+
     all_evidence = [fact for bundle in bundles.values() for fact in bundle]
     context = _EvidenceContext(all_evidence, amount_tolerance)
     raw_results = {
@@ -97,15 +107,135 @@ def validate(
     hypotheses: Iterable[str] | None = None,
     *,
     amount_tolerance: Decimal = MONEY,
+    llm_client: StructuredLLMClient | None = None,
+    use_llm: bool | None = None,
 ) -> list[HypothesisResult]:
-    return validate_hypotheses(evidence_bundles, hypotheses, amount_tolerance=amount_tolerance)
+    return validate_hypotheses(
+        evidence_bundles,
+        hypotheses,
+        amount_tolerance=amount_tolerance,
+        llm_client=llm_client,
+        use_llm=use_llm,
+    )
 
 
 def validator_node(state: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
     evidence_bundles = state.get("evidence_bundles", state.get("evidence", {}))
     hypotheses = state.get("hypotheses")
-    validations = validate_hypotheses(evidence_bundles, hypotheses)
+    validations = validate_hypotheses(
+        evidence_bundles,
+        hypotheses,
+        use_llm=state.get("use_llm"),
+    )
     return {"validations": [validation.to_dict() for validation in validations]}
+
+
+def _validate_with_llm(
+    bundles: Mapping[str, list[dict[str, Any]]],
+    requested: Sequence[Hypothesis],
+    llm_client: StructuredLLMClient,
+) -> list[HypothesisResult]:
+    output = llm_client.complete_json(
+        task="hypothesis_validation",
+        system_prompt=(
+            "You are the hypothesis validator for a financial reconciliation investigator. "
+            "Use only supplied evidence. Do not invent source records, amounts, refunds, "
+            "fees, dates, calculations, or prior cases. Return one result for each requested "
+            "hypothesis and show arithmetic explicitly when it supports or rejects a cause."
+        ),
+        user_payload={
+            "requested_hypotheses": list(requested),
+            "evidence_bundles": jsonable(bundles),
+            "allowed_conclusions": [
+                "SUPPORTED",
+                "PARTIALLY_SUPPORTED",
+                "REJECTED",
+                "INSUFFICIENT_EVIDENCE",
+            ],
+        },
+        schema=_VALIDATOR_SCHEMA,
+    )
+    raw_results = output.get("results")
+    if not isinstance(raw_results, list):
+        raise ValueError("Validator LLM output must include results as a list.")
+
+    by_hypothesis: dict[str, HypothesisResult] = {}
+    for item in raw_results:
+        if not isinstance(item, Mapping):
+            raise ValueError("Each validator result must be an object.")
+        result = HypothesisResult(
+            hypothesis=_controlled_hypothesis(str(item.get("hypothesis"))),
+            evidence_for=_list_of_dicts(item.get("evidence_for")),
+            evidence_against=_list_of_dicts(item.get("evidence_against")),
+            missing_evidence=_list_of_strings(item.get("missing_evidence")),
+            reasoning=_list_of_strings(item.get("reasoning")),
+            calculations=_list_of_strings(item.get("calculations")),
+            conclusion=_conclusion(str(item.get("conclusion"))),
+            confidence=_confidence(item.get("confidence")),
+        )
+        by_hypothesis[result.hypothesis] = result
+
+    missing = [hypothesis for hypothesis in requested if hypothesis not in by_hypothesis]
+    if missing:
+        raise ValueError(f"Validator LLM omitted hypotheses: {missing}")
+    return [by_hypothesis[hypothesis] for hypothesis in requested]
+
+
+_EVIDENCE_ITEM_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "fact": {"type": "string"},
+        "value": {"type": ["string", "null"]},
+        "source": {"type": ["string", "null"]},
+        "source_record_id": {"type": ["string", "null"]},
+        "retrieval_status": {"type": ["string", "null"]},
+    },
+    "required": ["fact", "value", "source", "source_record_id", "retrieval_status"],
+}
+
+_VALIDATOR_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "hypothesis": {"type": "string", "enum": list(CONTROLLED_HYPOTHESES)},
+                    "evidence_for": {"type": "array", "items": _EVIDENCE_ITEM_SCHEMA},
+                    "evidence_against": {"type": "array", "items": _EVIDENCE_ITEM_SCHEMA},
+                    "missing_evidence": {"type": "array", "items": {"type": "string"}},
+                    "reasoning": {"type": "array", "items": {"type": "string"}},
+                    "calculations": {"type": "array", "items": {"type": "string"}},
+                    "conclusion": {
+                        "type": "string",
+                        "enum": [
+                            "SUPPORTED",
+                            "PARTIALLY_SUPPORTED",
+                            "REJECTED",
+                            "INSUFFICIENT_EVIDENCE",
+                        ],
+                    },
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+                "required": [
+                    "hypothesis",
+                    "evidence_for",
+                    "evidence_against",
+                    "missing_evidence",
+                    "reasoning",
+                    "calculations",
+                    "conclusion",
+                    "confidence",
+                ],
+            },
+        }
+    },
+    "required": ["results"],
+}
 
 
 class _EvidenceContext:
@@ -269,13 +399,25 @@ def _validate_refund(context: _EvidenceContext) -> HypothesisResult:
 
 
 def _validate_timing_difference(context: _EvidenceContext) -> HypothesisResult:
-    evidence_for = context.found("settlement_delay", "pending_settlement")
+    unavailable = context.unavailable("bank_settlement")
+    if unavailable:
+        return HypothesisResult(
+            "timing_difference",
+            missing_evidence=["Bank settlement source is unavailable."],
+            reasoning=["Settlement timing cannot be validated while the bank source is unavailable."],
+            conclusion="INSUFFICIENT_EVIDENCE",
+            confidence=Decimal("0.25"),
+        )
+    evidence_for = [
+        *context.found("settlement_delay", "pending_settlement"),
+        *context.not_found("bank_settlement"),
+    ]
     evidence_against = context.found("bank_settlement")
     if evidence_for and not evidence_against:
         return HypothesisResult(
             "timing_difference",
             evidence_for=evidence_for,
-            reasoning=["Timing difference is supported because settlement is still pending within the expected window."],
+            reasoning=["Timing difference is supported because the bank lookup completed and settlement is still pending."],
             conclusion="SUPPORTED",
             confidence=Decimal("0.85"),
         )
@@ -359,6 +501,31 @@ def _normalize_facts(evidence: Any) -> list[dict[str, Any]]:
         else:
             normalized.append({"fact": str(fact), "value": fact, "status": "FOUND"})
     return normalized
+
+
+def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, Mapping)]
+
+
+def _list_of_strings(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
+
+
+def _conclusion(value: str) -> Conclusion:
+    if value not in {"SUPPORTED", "PARTIALLY_SUPPORTED", "REJECTED", "INSUFFICIENT_EVIDENCE"}:
+        raise ValueError(f"Unknown validation conclusion: {value}")
+    return value  # type: ignore[return-value]
+
+
+def _confidence(value: Any) -> Decimal:
+    confidence = _to_decimal(value)
+    if confidence is None:
+        raise ValueError("Validator confidence must be numeric.")
+    return max(Decimal("0.00"), min(Decimal("1.00"), confidence))
 
 
 def _controlled_hypotheses(hypotheses: Iterable[str] | Mapping[str, Any]) -> list[Hypothesis]:

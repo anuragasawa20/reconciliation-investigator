@@ -2,37 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Iterable, Literal, Mapping, Sequence
+from typing import Iterable, Mapping, Sequence
 
+from agents.llm import StructuredLLMClient, default_llm_client, jsonable
 from core.matcher import ReconciliationRecord
 from core.normalizer import NormalizedRecord
-
-
-Hypothesis = Literal[
-    "gateway_fee",
-    "refund",
-    "timing_difference",
-    "manual_adjustment",
-    "duplicate_or_missing_transaction",
-    "unknown_other",
-]
-
-HYPOTHESIS_TAXONOMY: tuple[Hypothesis, ...] = (
-    "gateway_fee",
-    "refund",
-    "timing_difference",
-    "manual_adjustment",
-    "duplicate_or_missing_transaction",
-    "unknown_other",
-)
-
-
-@dataclass(frozen=True)
-class HistoricalCase:
-    case_id: str
-    hypothesis: Hypothesis
-    summary: str = ""
-    confidence: Decimal | None = None
+from schemas import HistoricalCase, Hypothesis, HYPOTHESIS_TAXONOMY
 
 
 @dataclass(frozen=True)
@@ -44,16 +19,28 @@ class InvestigationPlan:
 def plan_investigation(
     exception: ReconciliationRecord,
     historical_cases: Sequence[HistoricalCase | Mapping[str, object]] | None = None,
+    *,
+    llm_client: StructuredLLMClient | None = None,
+    use_llm: bool | None = None,
 ) -> InvestigationPlan:
-    """Return the bounded hypotheses still worth investigating for an exception.
+    """Return the bounded hypotheses still worth investigating for an exception."""
 
-    The planner is intentionally deterministic for the MVP: source matching and
-    arithmetic are already controlled by the core reconciliation layer, so this
-    function only prunes hypotheses that are clearly inconsistent with the known
-    record shape and amounts.
-    """
+    active_client = llm_client if use_llm is not False else None
+    if active_client is None and use_llm is not False:
+        active_client = default_llm_client()
+    if active_client is not None:
+        return _plan_with_llm(exception, historical_cases or [], active_client)
 
-    historical_hypotheses = _historical_hypotheses(historical_cases or [])
+    return _plan_deterministically(exception, historical_cases or [])
+
+
+def _plan_deterministically(
+    exception: ReconciliationRecord,
+    historical_cases: Sequence[HistoricalCase | Mapping[str, object]],
+) -> InvestigationPlan:
+    """Deterministic planner used for tests, offline demos, and LLM fallback."""
+
+    historical_hypotheses = _historical_hypotheses(historical_cases)
     live: list[Hypothesis] = []
 
     for hypothesis in HYPOTHESIS_TAXONOMY:
@@ -65,6 +52,85 @@ def plan_investigation(
     live = _ordered_by_signal(live, exception, historical_hypotheses)
     live.append("unknown_other")
     return InvestigationPlan(invoice_id=exception.invoice_id, live_hypotheses=live)
+
+
+def _plan_with_llm(
+    exception: ReconciliationRecord,
+    historical_cases: Sequence[HistoricalCase | Mapping[str, object]],
+    llm_client: StructuredLLMClient,
+) -> InvestigationPlan:
+    deterministic = _plan_deterministically(exception, historical_cases)
+    payload = {
+        "exception": _exception_payload(exception),
+        "historical_cases": jsonable(historical_cases),
+        "allowed_hypotheses": list(HYPOTHESIS_TAXONOMY),
+        "deterministic_candidate_plan": deterministic.live_hypotheses,
+    }
+    output = llm_client.complete_json(
+        task="investigation_plan",
+        system_prompt=(
+            "You are the hypothesis planner for a financial reconciliation investigator. "
+            "Select only hypotheses from the allowed taxonomy. Keep unknown_other as the "
+            "last fallback. Do not invent transactions, amounts, dates, or causes."
+        ),
+        user_payload=payload,
+        schema=_PLANNER_SCHEMA,
+    )
+    hypotheses = _coerce_hypotheses(output.get("live_hypotheses"))
+    if "unknown_other" not in hypotheses:
+        hypotheses.append("unknown_other")
+    hypotheses = list(dict.fromkeys(hypotheses))
+    return InvestigationPlan(invoice_id=exception.invoice_id, live_hypotheses=hypotheses)
+
+
+_PLANNER_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "live_hypotheses": {
+            "type": "array",
+            "items": {"type": "string", "enum": list(HYPOTHESIS_TAXONOMY)},
+        }
+    },
+    "required": ["live_hypotheses"],
+}
+
+
+def _coerce_hypotheses(value: object) -> list[Hypothesis]:
+    if not isinstance(value, list):
+        raise ValueError("Planner LLM output must include live_hypotheses as a list.")
+    hypotheses: list[Hypothesis] = []
+    for item in value:
+        if item not in HYPOTHESIS_TAXONOMY:
+            raise ValueError(f"Planner returned unknown hypothesis: {item!r}")
+        hypotheses.append(item)
+    return hypotheses
+
+
+def _exception_payload(exception: ReconciliationRecord) -> dict[str, object]:
+    pairwise_differences = {
+        match.pair: str(match.difference)
+        for match in exception.pairwise
+        if match.difference is not None
+    }
+    return {
+        "invoice_id": exception.invoice_id,
+        "match_status": exception.match_status,
+        "exception_reasons": list(exception.exception_reasons),
+        "matched_by": list(exception.matched_by),
+        "warnings": list(exception.warnings),
+        "canonical_transaction": exception.canonical_transaction,
+        "gross_difference": pairwise_differences.get("erp_gateway"),
+        "settlement_difference": pairwise_differences.get("gateway_bank")
+        or pairwise_differences.get("erp_bank"),
+        "erp_count": len(exception.erp),
+        "gateway_count": len(exception.gateway),
+        "bank_count": len(exception.bank),
+        "erp": jsonable(exception.erp),
+        "gateway": jsonable(exception.gateway),
+        "bank": jsonable(exception.bank),
+        "pairwise": jsonable(exception.pairwise),
+    }
 
 
 def _is_live(
@@ -190,4 +256,3 @@ def _single(records: Iterable[NormalizedRecord]) -> NormalizedRecord | None:
     if len(records) != 1:
         return None
     return records[0]
-

@@ -6,29 +6,20 @@ Interpretation and financial calculations belong to downstream nodes.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import tools
+from schemas import HYPOTHESIS_TOOL_MAP
 
-
-HYPOTHESIS_TOOL_MAP: dict[str, tuple[str, ...]] = {
-    "gateway_fee": (
-        "get_gateway_transaction", "get_fee_configuration", "get_bank_settlement",
-        "get_refund_record",
-    ),
-    "refund": (
-        "get_gateway_transaction", "get_refund_record", "get_bank_settlement",
-    ),
-    "timing_difference": ("get_gateway_transaction", "get_bank_settlement"),
-    "manual_adjustment": ("get_erp_transaction", "get_related_transactions"),
-    "duplicate_or_missing_transaction": ("get_related_transactions",),
-    "unknown_other": ("get_related_transactions",),
-}
+ToolProgress = Callable[[str, str, str, dict[str, Any] | None], None]
 
 
 def collect_evidence(
-    live_hypotheses: Sequence[str], invoice_id: str,
+    live_hypotheses: Sequence[str],
+    invoice_id: str,
+    *,
+    on_result: ToolProgress | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Call each hypothesis's mapped tools with the invoice ID and bundle results.
 
@@ -47,10 +38,15 @@ def collect_evidence(
 
     evidence_bundles: dict[str, dict[str, Any]] = {}
     for hypothesis in dict.fromkeys(hypotheses):
-        evidence_bundles[hypothesis] = {
-            name: getattr(tools, name)(invoice_id=invoice_id)
-            for name in HYPOTHESIS_TOOL_MAP[hypothesis]
-        }
+        bundle: dict[str, Any] = {}
+        for name in HYPOTHESIS_TOOL_MAP[hypothesis]:
+            if on_result is not None:
+                on_result("start", hypothesis, name, None)
+            result = getattr(tools, name)(invoice_id=invoice_id)
+            bundle[name] = result
+            if on_result is not None:
+                on_result("finish", hypothesis, name, result)
+        evidence_bundles[hypothesis] = bundle
     return evidence_bundles
 
 

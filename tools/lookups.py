@@ -35,16 +35,22 @@ def _result(source: str, records: Iterable[dict[str, Any]], *, query: dict[str, 
 def get_erp_transaction(transaction_id: str | None = None, invoice_id: str | None = None) -> dict[str, Any]:
     """Return ERP records filtered by transaction ID or invoice ID."""
     rows = _rows("erp.csv")
-    records = [r for r in rows if (transaction_id and r["transaction_id"] == transaction_id)
-               or (invoice_id and r["invoice_id"] == invoice_id)]
+    if transaction_id is None and invoice_id is None:
+        records = rows
+    else:
+        records = [r for r in rows if (transaction_id and r["transaction_id"] == transaction_id)
+                   or (invoice_id and r["invoice_id"] == invoice_id)]
     return _result("erp", records, query={"transaction_id": transaction_id, "invoice_id": invoice_id})
 
 
 def get_gateway_transaction(transaction_id: str | None = None, invoice_id: str | None = None) -> dict[str, Any]:
     """Return gateway records filtered by gateway transaction or invoice ID."""
     rows = _rows("gateway.csv")
-    records = [r for r in rows if (transaction_id and r["transaction_id"] == transaction_id)
-               or (invoice_id and r["invoice_id"] == invoice_id)]
+    if transaction_id is None and invoice_id is None:
+        records = rows
+    else:
+        records = [r for r in rows if (transaction_id and r["transaction_id"] == transaction_id)
+                   or (invoice_id and r["invoice_id"] == invoice_id)]
     return _result("gateway", records, query={"transaction_id": transaction_id, "invoice_id": invoice_id})
 
 
@@ -61,13 +67,16 @@ def get_fee_configuration(gateway_transaction_id: str | None = None, invoice_id:
 
 def get_bank_settlement(settlement_id: str | None = None, invoice_id: str | None = None) -> dict[str, Any]:
     """Return bank settlements by settlement ID, or resolve one from an invoice."""
+    rows = _rows("bank.csv")
     if invoice_id and not settlement_id:
         gateway = get_gateway_transaction(invoice_id=invoice_id)
         settlement_ids = {row["settlement_id"] for row in gateway["records"] if row["settlement_id"]}
+        records = [row for row in rows if row["settlement_id"] in settlement_ids]
+    elif settlement_id is None and invoice_id is None:
+        records = rows
     else:
         settlement_ids = {settlement_id} if settlement_id else set()
-    rows = _rows("bank.csv")
-    records = [row for row in rows if row["settlement_id"] in settlement_ids]
+        records = [row for row in rows if row["settlement_id"] in settlement_ids]
     return _result("bank", records, query={"settlement_id": settlement_id, "invoice_id": invoice_id})
 
 

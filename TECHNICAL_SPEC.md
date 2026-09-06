@@ -632,6 +632,9 @@ The demo must show three cases:
 
 Use one Streamlit dashboard.
 
+Detailed Streamlit frontend behavior, layout, state, accessibility, and demo
+acceptance criteria are captured in `docs/FRONTEND_SPEC.md`.
+
 ### 10.1 Summary
 
 Display:

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Iterable, Literal, Mapping, Sequence
 
+from agents.llm import StructuredLLMClient, default_llm_client, jsonable
 from agents.planner import HistoricalCase, Hypothesis
 from core.matcher import MatchConfig, ReconciliationRecord
 from core.normalizer import NormalizedRecord
@@ -48,11 +49,37 @@ def challenge_hypotheses(
     validations: Sequence[HypothesisValidation | Mapping[str, object]],
     historical_cases: Sequence[HistoricalCase | Mapping[str, object]] | None = None,
     config: MatchConfig | None = None,
+    *,
+    llm_client: StructuredLLMClient | None = None,
+    use_llm: bool | None = None,
 ) -> ChallengeResult:
     """Challenge the leading supported hypothesis as a separate investigation step."""
 
     config = config or MatchConfig()
     normalized = [_coerce_validation(result) for result in validations]
+    active_client = llm_client if use_llm is not False else None
+    if active_client is None and use_llm is not False:
+        active_client = default_llm_client()
+    if active_client is not None:
+        deterministic = _challenge_deterministically(exception, normalized, historical_cases, config)
+        return _challenge_with_llm(
+            exception,
+            normalized,
+            historical_cases or [],
+            config,
+            deterministic,
+            active_client,
+        )
+
+    return _challenge_deterministically(exception, normalized, historical_cases, config)
+
+
+def _challenge_deterministically(
+    exception: ReconciliationRecord,
+    normalized: Sequence[HypothesisValidation],
+    historical_cases: Sequence[HistoricalCase | Mapping[str, object]] | None,
+    config: MatchConfig,
+) -> ChallengeResult:
     leading = _leading_supported(normalized)
     notes = _unwarranted_rejection_notes(normalized)
 
@@ -208,6 +235,92 @@ def _challenge_gateway_fee(
     )
 
 
+def _challenge_with_llm(
+    exception: ReconciliationRecord,
+    validations: Sequence[HypothesisValidation],
+    historical_cases: Sequence[HistoricalCase | Mapping[str, object]],
+    config: MatchConfig,
+    deterministic: ChallengeResult,
+    llm_client: StructuredLLMClient,
+) -> ChallengeResult:
+    output = llm_client.complete_json(
+        task="hypothesis_challenge",
+        system_prompt=(
+            "You are the challenger for a financial reconciliation investigator. "
+            "Try to falsify the leading supported hypothesis using only supplied "
+            "evidence, source records, validations, and historical cases. Do not "
+            "invent facts. Force human review when contradictions or unresolved "
+            "questions materially weaken the conclusion."
+        ),
+        user_payload={
+            "exception": jsonable(exception),
+            "validations": jsonable(validations),
+            "historical_cases": jsonable(historical_cases),
+            "amount_tolerance": str(config.amount_tolerance),
+            "deterministic_challenge": _challenge_payload(deterministic),
+        },
+        schema=_CHALLENGER_SCHEMA,
+    )
+    return ChallengeResult(
+        hypothesis=_optional_hypothesis(output.get("hypothesis")),
+        checks_performed=_challenge_checks(output.get("checks_performed")),
+        contradictory_evidence=_string_list(output.get("contradictory_evidence")),
+        unresolved_questions=_string_list(output.get("unresolved_questions")),
+        challenge_notes=_string_list(output.get("challenge_notes")),
+        adjusted_confidence=_bounded_decimal(output.get("adjusted_confidence")),
+        force_human_review=bool(output.get("force_human_review")),
+        final_explanation=_optional_string(output.get("final_explanation")),
+    )
+
+
+_CHALLENGE_CHECK_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "name": {"type": "string"},
+        "passed": {"type": "boolean"},
+        "detail": {"type": "string"},
+    },
+    "required": ["name", "passed", "detail"],
+}
+
+_CHALLENGER_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "hypothesis": {
+            "type": ["string", "null"],
+            "enum": [
+                "gateway_fee",
+                "refund",
+                "timing_difference",
+                "manual_adjustment",
+                "duplicate_or_missing_transaction",
+                "unknown_other",
+                None,
+            ],
+        },
+        "checks_performed": {"type": "array", "items": _CHALLENGE_CHECK_SCHEMA},
+        "contradictory_evidence": {"type": "array", "items": {"type": "string"}},
+        "unresolved_questions": {"type": "array", "items": {"type": "string"}},
+        "challenge_notes": {"type": "array", "items": {"type": "string"}},
+        "adjusted_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "force_human_review": {"type": "boolean"},
+        "final_explanation": {"type": ["string", "null"]},
+    },
+    "required": [
+        "hypothesis",
+        "checks_performed",
+        "contradictory_evidence",
+        "unresolved_questions",
+        "challenge_notes",
+        "adjusted_confidence",
+        "force_human_review",
+        "final_explanation",
+    ],
+}
+
+
 def _challenge_generic(
     exception: ReconciliationRecord,
     leading: HypothesisValidation,
@@ -233,6 +346,70 @@ def _leading_supported(validations: Sequence[HypothesisValidation]) -> Hypothesi
     return sorted(supported, key=lambda result: result.confidence, reverse=True)[0]
 
 
+def _challenge_payload(result: ChallengeResult) -> dict[str, object]:
+    return {
+        "hypothesis": result.hypothesis,
+        "checks_performed": jsonable(result.checks_performed),
+        "contradictory_evidence": list(result.contradictory_evidence),
+        "unresolved_questions": list(result.unresolved_questions),
+        "challenge_notes": list(result.challenge_notes),
+        "adjusted_confidence": str(result.adjusted_confidence),
+        "force_human_review": result.force_human_review,
+        "final_explanation": result.final_explanation,
+    }
+
+
+ALLOWED_HYPOTHESES = {
+    "gateway_fee",
+    "refund",
+    "timing_difference",
+    "manual_adjustment",
+    "duplicate_or_missing_transaction",
+    "unknown_other",
+}
+
+
+def _normalize_hypothesis(value: object) -> str:
+    hypothesis = "unknown_other" if value == "unknown" else str(value)
+    if hypothesis not in ALLOWED_HYPOTHESES:
+        raise ValueError(f"Unknown hypothesis: {value}")
+    return hypothesis
+
+
+def _optional_hypothesis(value: object) -> Hypothesis | None:
+    if value is None:
+        return None
+    return _normalize_hypothesis(value)  # type: ignore[return-value]
+
+
+def _challenge_checks(value: object) -> list[ChallengeCheck]:
+    if not isinstance(value, list):
+        return []
+    checks: list[ChallengeCheck] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        checks.append(
+            ChallengeCheck(
+                name=str(item.get("name", "")),
+                passed=bool(item.get("passed")),
+                detail=str(item.get("detail", "")),
+            )
+        )
+    return checks
+
+
+def _bounded_decimal(value: object) -> Decimal:
+    confidence = _decimal(value or Decimal("0.00"))
+    return max(Decimal("0.00"), min(Decimal("1.00"), confidence))
+
+
+def _optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
 def _unwarranted_rejection_notes(validations: Sequence[HypothesisValidation]) -> list[str]:
     notes: list[str] = []
     for result in validations:
@@ -250,11 +427,9 @@ def _unwarranted_rejection_notes(validations: Sequence[HypothesisValidation]) ->
 def _coerce_validation(value: HypothesisValidation | Mapping[str, object]) -> HypothesisValidation:
     if isinstance(value, HypothesisValidation):
         return value
-    hypothesis = value.get("hypothesis")
+    hypothesis = _normalize_hypothesis(value.get("hypothesis"))
     conclusion = value.get("conclusion", "INSUFFICIENT_EVIDENCE")
     confidence = value.get("confidence", Decimal("0.00"))
-    if hypothesis not in {"gateway_fee", "refund", "timing_difference", "manual_adjustment", "duplicate_or_missing_transaction", "unknown_other"}:
-        raise ValueError(f"Unknown hypothesis: {hypothesis}")
     if conclusion not in {"SUPPORTED", "PARTIALLY_SUPPORTED", "NOT_SUPPORTED", "INSUFFICIENT_EVIDENCE"}:
         raise ValueError(f"Unknown validation conclusion: {conclusion}")
     return HypothesisValidation(

@@ -12,6 +12,13 @@ from decimal import Decimal
 from enum import Enum
 from typing import Iterable
 
+from config import (
+    AUTO_RESOLVE_CEILING,
+    HIGH_CONFIDENCE_THRESHOLD,
+    MEDIUM_CONFIDENCE_THRESHOLD,
+    MIN_EVIDENCE_FOR_AUTO,
+)
+
 
 class RecommendationAction(str, Enum):
     AUTO_RESOLVE = "AUTO_RESOLVE"
@@ -89,10 +96,10 @@ class HypothesisResult:
 
 @dataclass(frozen=True)
 class RecommendationPolicy:
-    high_confidence_threshold: Decimal | int | str = Decimal("0.90")
-    medium_confidence_threshold: Decimal | int | str = Decimal("0.70")
-    materiality_ceiling: Decimal | int | str = Decimal("500.00")
-    minimum_current_sources_for_auto: int = 2
+    high_confidence_threshold: Decimal | int | str = HIGH_CONFIDENCE_THRESHOLD
+    medium_confidence_threshold: Decimal | int | str = MEDIUM_CONFIDENCE_THRESHOLD
+    materiality_ceiling: Decimal | int | str = AUTO_RESOLVE_CEILING
+    minimum_current_sources_for_auto: int = MIN_EVIDENCE_FOR_AUTO
     auto_resolve_hypotheses: frozenset[str] = frozenset({"gateway_fee"})
 
     def __post_init__(self) -> None:

@@ -37,6 +37,16 @@ class LookupToolTests(unittest.TestCase):
             "query": {"transaction_id": None, "invoice_id": "INV-DOES-NOT-EXIST"},
         })
 
+    def test_no_filter_returns_full_dataset(self):
+        gateway = get_gateway_transaction()
+        self.assertEqual(gateway["status"], "FOUND")
+        self.assertGreaterEqual(gateway["count"], 1)
+        self.assertIn("INV-DEMO-FEE-0001", {row["invoice_id"] for row in gateway["records"]})
+
+        bank = get_bank_settlement()
+        self.assertEqual(bank["status"], "FOUND")
+        self.assertGreaterEqual(bank["count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

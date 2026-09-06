@@ -47,6 +47,24 @@ class EvidenceCollectorTests(unittest.TestCase):
             for name in names:
                 self.assertIs(bundles[hypothesis][name], results[name].pop(0))
 
+    def test_on_result_receives_start_and_finish_for_each_tool(self):
+        observed = []
+
+        def on_result(phase, hypothesis, tool_name, result):
+            observed.append((phase, hypothesis, tool_name, result))
+
+        raw = {"status": "NOT_FOUND", "records": []}
+        with patch.object(collector.tools, "get_related_transactions", return_value=raw):
+            collector.collect_evidence(["unknown_other"], "INV-1", on_result=on_result)
+
+        self.assertEqual(
+            observed,
+            [
+                ("start", "unknown_other", "get_related_transactions", None),
+                ("finish", "unknown_other", "get_related_transactions", raw),
+            ],
+        )
+
     def test_empty_duplicate_and_invalid_inputs(self):
         with patch.object(collector.tools, "get_related_transactions") as tool:
             self.assertEqual(collector.collect_evidence([], "INV-1"), {})
@@ -124,7 +142,7 @@ class EvidenceCollectorTests(unittest.TestCase):
                 imports.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 imports.add(node.module)
-        self.assertEqual(imports, {"__future__", "collections.abc", "typing", "tools"})
+        self.assertEqual(imports, {"__future__", "collections.abc", "typing", "tools", "schemas"})
 
 
 if __name__ == "__main__":
