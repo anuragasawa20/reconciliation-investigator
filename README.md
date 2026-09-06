@@ -8,7 +8,7 @@ Python owns money, matching, and retrieval. AI may rank hypotheses and write the
 
 Hero case `INV-1045`: ERP ₹10,000, gateway ₹10,000, bank ₹9,700. Root cause `gateway_fee`. HIGH confidence. `AUTO_RESOLVE`.
 
-Editable board: [`docs/submission-architecture.excalidraw`](docs/submission-architecture.excalidraw). Product contract: [`TECHNICAL_SPEC.md`](TECHNICAL_SPEC.md).
+Editable board: `[docs/submission-architecture.excalidraw](docs/submission-architecture.excalidraw)`. 
 
 ## Architecture
 
@@ -70,17 +70,25 @@ flowchart TB
   INV --> N1
 ```
 
+
+
+
+
 ### What each layer owns
 
-| Layer | Code | Owns |
-|---|---|---|
-| Sources | `data/*.csv` | ERP booked amount, gateway fee/refund, bank settlement. No live APIs. |
-| Deterministic core | `core/` | Load, validate, normalize, match, isolate exceptions. Matched records never call the investigator. |
-| Investigation graph | `graph/reconciliation_graph.py` | Checkpointed LangGraph with `SqliteSaver`. Nodes listed above. |
-| Evidence tools | `tools/` | Facts with source, record id, value, retrieval status. `NOT_FOUND` is not `SOURCE_UNAVAILABLE`. |
-| AI-assisted nodes | `agents/` | Planner, validator, challenger, recommendation. Structured JSON via OpenRouter `ChatOpenAI`. Schema-validated. Deterministic fallbacks if LLM is off. |
-| Policy | `config.py` | Thresholds live in code, not in prompts. |
-| UI | `ui/app.py` | Streamlit control room: explanation first, live agent path, human interrupt. |
+
+| Layer               | Code                            | Owns                                                                                                                                                  |
+| ------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Sources             | `data/*.csv`                    | ERP booked amount, gateway fee/refund, bank settlement. No live APIs.                                                                                 |
+| Deterministic core  | `core/`                         | Load, validate, normalize, match, isolate exceptions. Matched records never call the investigator.                                                    |
+| Investigation graph | `graph/reconciliation_graph.py` | Checkpointed LangGraph with `SqliteSaver`. Nodes listed above.                                                                                        |
+| Evidence tools      | `tools/`                        | Facts with source, record id, value, retrieval status. `NOT_FOUND` is not `SOURCE_UNAVAILABLE`.                                                       |
+| AI-assisted nodes   | `agents/`                       | Planner, validator, challenger, recommendation. Structured JSON via OpenRouter `ChatOpenAI`. Schema-validated. Deterministic fallbacks if LLM is off. |
+| Policy              | `config.py`                     | Thresholds live in code, not in prompts.                                                                                                              |
+| UI                  | `ui/app.py`                     | Streamlit control room: explanation first, live agent path, human interrupt.                                                                          |
+
+
+
 
 ### Controlled hypotheses (`schemas.py`)
 
@@ -91,10 +99,12 @@ Planner output is enum-validated. There is no free-form cause chain.
 ### Decision policy (`config.py`)
 
 - HIGH ≥ 0.90, required evidence present, no material contradiction
-- MEDIUM 0.70–&lt;0.90 · LOW &lt; 0.70
+- MEDIUM 0.70–<0.90 · LOW < 0.70
 - `AUTO_RESOLVE` also needs at least two facts and amount ≤ ₹500
 - No hypothesis ≥ 0.70 → `unknown_other` + `HUMAN_REVIEW`
 - Invalid LLM JSON: retry once, then human review
+
+
 
 ### Evidence tools (`tools/`)
 
@@ -107,6 +117,8 @@ Tools return facts. They do not decide whether a hypothesis is true.
 1. Easy win — gateway fee, high confidence, auto-resolve
 2. Refund — evidence explains the shortfall
 3. Hard case — competing or missing evidence, safe human-review abstention
+
+
 
 ## Python environment
 
